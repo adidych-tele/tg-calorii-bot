@@ -153,38 +153,87 @@ module.exports = async (req, res) => {
       }
 
       // Фото
-      if (msg.photo && msg.photo.length) {
-        dailyReset(chat_id);
+     // === Фото или картинка как документ ===
+let fileId = null;
 
-        const can = canSpendAnalysis(chat_id);
-        if (!can.allowed) {
-          await sendMessage(chat_id,
+if (msg.photo && msg.photo.length) {
+  // обычное "Фото"
+  const largest = msg.photo[msg.photo.length - 1];
+  fileId = largest.file_id;
+} else if (msg.document && msg.document.mime_type && msg.document.mime_type.startsWith('image/')) {
+  // "Отправить как файл" -> document (image/*)
+  fileId = msg.document.file_id;
+}
+
+if (fileId) {
+  dailyReset(chat_id);
+
+  const can = canSpendAnalysis(chat_id);
+  if (!can.allowed) {
+    await sendMessage(chat_id,
 `Сегодня лимит исчерпан (${FREE_DAILY_LIMIT}/${FREE_DAILY_LIMIT}) 🚦
 Завтра снова бесплатно 🎉
 
 Хочешь продолжить сейчас? Пакеты оплат добавим скоро ⭐`);
-          return res.json({ ok: true });
-        }
-        spendOne(chat_id);
+    return res.json({ ok: true });
+  }
+  spendOne(chat_id);
 
-        const largest = msg.photo[msg.photo.length - 1];
-        const fileId = largest.file_id;
-        const filePath = await getFilePath(fileId);
-        if (!filePath) {
-          await sendMessage(chat_id, `Не смог скачать фото. Попробуй ещё раз.`);
-          return res.json({ ok: true });
-        }
-        const fileUrl = `${TG_FILE}/${filePath}`;
+  // Получаем file_path с диагностикой
+  const { ok, file_path, debug } = await safeGetFilePath(fileId);
 
-        const analysis = await analyzeImageWithOpenAI(fileUrl);
-        if (analysis?.error === 'not_food') {
-          await sendMessage(chat_id, `Похоже, на фото не еда 🙂 Пришли фото блюда сверху, при хорошем освещении.`);
-          return res.json({ ok: true });
-        }
-        if (!analysis) {
-          await sendMessage(chat_id, `Не удалось проанализировать. Попробуй другой ракурс или ярче освещение.`);
-          return res.json({ ok: true });
-        }
+  if (!ok || !file_path) {
+    // ВРЕМЕННАЯ диагностика: покажем пользователю, что ответил Telegram (обрежем до 400 символов)
+    const dbg = (debug && JSON.stringify(debug).slice(0, 400)) || 'нет данных';
+    await sendMessage(chat_id, `Не смог скачать фото. Спробуй ще раз як "Фото", а не "Файл".\n(dbg: ${dbg})`);
+    return res.json({ ok: true });
+  }
+
+  const fileUrl = `${TG_FILE}/${file_path}`;
+
+  const analysis = await analyzeImageWithOpenAI(fileUrl);
+  if (analysis?.error === 'not_food') {
+    await sendMessage(chat_id, `Похоже, на фото не еда 🙂 Пришли фото блюда сверху, при хорошем освещении.`);
+    return res.json({ ok: true });
+  }
+  if (!analysis) {
+    await sendMessage(chat_id, `Не удалось проанализировать. Попробуй другой ракурс или ярче освещение.`);
+    return res.json({ ok: true });
+  }
+
+  // Сохраняем последний анализ у пользователя
+  const u = getUser(chat_id);
+  u._lastAnalysis = analysis;
+  setUser(chat_id, u);
+
+  // Обновим съедено и остаток
+  const kcal = Math.max(0, Math.round(analysis.calories_estimate || 0));
+  u.consumedToday = (u.consumedToday || 0) + kcal;
+  setUser(chat_id, u);
+  const remaining = u.dailyTarget != null ? Math.max(0, u.dailyTarget - u.consumedToday) : null;
+
+  if (Array.isArray(analysis.tips)) lastTips.set(String(chat_id), analysis.tips);
+
+  // Сообщение №1 — карточка результата (советы по кнопке)
+  const text = formatMealMessage(analysis, remaining, u.dailyTarget);
+  await sendMessage(chat_id, text, {
+    inline_keyboard: [[{ text: '🔁 Хочу советы', callback_data: 'tips' }]]
+  });
+
+  // Небольшая пауза
+  await new Promise(r => setTimeout(r, 700));
+
+  // Сообщение №2 — follow-up
+  const followup = buildFollowup(chat_id, u, analysis);
+  await sendMessage(chat_id, followup.text, followup.keyboard);
+
+  return res.json({ ok: true });
+}
+
+// Если не фото и не изображение-документ:
+await sendMessage(chat_id, `Пришли, пожалуйста, фото блюда 📸`);
+return res.json({ ok: true });
+
 
         // Сохраняем последний анализ у пользователя
         const u = getUser(chat_id);
@@ -243,10 +292,17 @@ async function answerCallbackQuery(id) {
     body: JSON.stringify({ callback_query_id: id })
   });
 }
-async function getFilePath(file_id) {
-  const r = await fetch(`${TG_API}/getFile?file_id=${encodeURIComponent(file_id)}`);
-  const j = await r.json();
-  return j?.ok && j?.result?.file_path ? j.result.file_path : null;
+async function safeGetFilePath(file_id) {
+  try {
+    const r = await fetch(`${TG_API}/getFile?file_id=${encodeURIComponent(file_id)}`);
+    const j = await r.json();
+    if (j && j.ok && j.result && j.result.file_path) {
+      return { ok: true, file_path: j.result.file_path, debug: j };
+    }
+    return { ok: false, file_path: null, debug: j || null };
+  } catch (e) {
+    return { ok: false, file_path: null, debug: { error: String(e) } };
+  }
 }
 
 // ---------- OpenAI Vision ----------
